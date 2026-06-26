@@ -3,7 +3,10 @@
 # ruff: noqa: E402
 
 # isort: off
+import csv
 import gc
+import math
+from pathlib import Path
 
 import torch
 import triton
@@ -13,7 +16,7 @@ from utils import bootstrap_benchmark_env, ensure_save_path_exists
 bootstrap_benchmark_env(__file__)
 
 from benchmark.src.flash_attn_interface_ import (
-    flash_attn_varlen_func_CalKernelTime)
+    flash_attn_varlen_func_pip)
 from benchmark.src.get_model_config import (
     gen_cutlass_flash_attn_decode_correctness_configs as
     gen_correctness_config)
@@ -26,6 +29,8 @@ from benchmark.presets import get_hardware_preset
 # isort: on
 
 DEVICE = "xpu"
+_BENCHMARK_RESULT_CACHE = {}
+_BENCHMARK_INPUT_CACHE = {}
 
 
 def clear_xpu_cache():
@@ -47,6 +52,65 @@ def calculate_memory_usage(q_len_sum, kv_len_sum, num_heads, head_size,
         torch.tensor([], dtype=output_dtype).element_size()
     # Convert to GB
     return (query_memory + kv_cache_memory + output_memory) / (1000**3)
+
+
+def _safe_ratio(numerator, denominator):
+    if (not math.isfinite(numerator) or not math.isfinite(denominator)
+            or denominator == 0):
+        return float("nan")
+    return numerator / denominator
+
+
+def _benchmark_cache_key(config, provider, iterations):
+    return (tuple(config), provider, iterations)
+
+
+def _cache_result(cache_key, value):
+    _BENCHMARK_RESULT_CACHE[cache_key] = value
+    return value
+
+
+def append_speedup_average_row(save_path, plot_name):
+    if not save_path:
+        return
+    csv_path = Path(save_path) / f"{plot_name}.csv"
+    if not csv_path.exists():
+        return
+
+    with csv_path.open(newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or []
+        if not fieldnames:
+            return
+        rows = [
+            row for row in reader
+            if row.get(fieldnames[0]) != "Average Speedup"
+        ]
+
+    speedup_cols = [name for name in fieldnames if "Speedup" in name]
+    if not rows or not speedup_cols:
+        return
+
+    avg_row = {name: "" for name in fieldnames}
+    avg_row[fieldnames[0]] = "Average Speedup"
+    for col in speedup_cols:
+        values = []
+        for row in rows:
+            try:
+                value = float(row[col])
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                values.append(value)
+        if values:
+            avg_row[col] = f"{sum(values) / len(values):.6f}"
+
+    with csv_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+        writer.writerow(avg_row)
+    print(f"Wrote speedup averages to {csv_path}")
 
 
 def make_decode_with_paged_kv_input(config):
@@ -119,18 +183,27 @@ def calculate_diff_decode_paged_kv(config):
         key_cache, value_cache, query_lens, kv_lens = \
         make_decode_with_paged_kv_input(config)
 
-    output = flash_attn_varlen_func(maybe_quantized_query,
-                                    maybe_quantized_key_cache,
-                                    maybe_quantized_value_cache,
-                                    max_query_len,
-                                    cu_query_lens,
-                                    max_kv_len,
-                                    seqused_k=seq_k,
-                                    softmax_scale=scale,
-                                    causal=False,
-                                    block_table=block_tables,
-                                    window_size=(-1, -1),
-                                    s_aux=sink)
+    def run_op(op):
+        return op(maybe_quantized_query,
+                  maybe_quantized_key_cache,
+                  maybe_quantized_value_cache,
+                  max_query_len,
+                  cu_query_lens,
+                  max_kv_len,
+                  seqused_k=seq_k,
+                  softmax_scale=scale,
+                  causal=False,
+                  block_table=block_tables,
+                  window_size=(-1, -1),
+                  s_aux=sink)
+
+    output = run_op(flash_attn_varlen_func)
+    pip_output = None
+    pip_error = None
+    try:
+        pip_output = run_op(flash_attn_varlen_func_pip)
+    except Exception as e:
+        pip_error = e
 
     ref_output = ref_paged_attn(query=query,
                                 key_cache=key_cache,
@@ -147,143 +220,192 @@ def calculate_diff_decode_paged_kv(config):
     atol, rtol = 1e-2, 1e-2
     if q_dtype is not None:
         atol, rtol = 1.5e-1, 1.5e-1
+    vllm_matches = True
     try:
-        torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol), \
-            f"{torch.max(torch.abs(output - ref_output))}"
-        print("✅ All implementations match, ", config)
+        torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
     except AssertionError as e:
-        print("❌ Implementations differ, ", config, " error: ", e)
+        vllm_matches = False
+        print("❌ vllm_xpu_kernels differs from reference, ", config,
+              " error: ", e)
+
+    if pip_output is None:
+        print("Skipping xattention correctness for unsupported "
+              f"shape: {pip_error}")
+        if vllm_matches:
+            print("✅ vllm_xpu_kernels implementation matches, ", config)
+        return
+
+    xattention_matches = True
+    try:
+        torch.testing.assert_close(pip_output, ref_output, atol=atol,
+                                   rtol=rtol)
+    except AssertionError as e:
+        xattention_matches = False
+        print("❌ xattention differs from reference, ", config,
+              " error: ", e)
+
+    if vllm_matches and xattention_matches:
+        print("✅ All implementations match, ", config)
 
 
 def benchmark_decode_with_paged_kv(seq_lens, num_heads, head_size, block_size,
                                    output_dtype, soft_cap, num_blocks,
                                    fa_versions, q_dtype, is_sink, provider,
                                    iterations):
-    maybe_quantized_query, maybe_quantized_key_cache, \
-        maybe_quantized_value_cache, max_query_len, cu_query_lens, \
-        max_kv_len, seq_k, scale, block_tables, sink, _, \
-        _, _, _, _ = make_decode_with_paged_kv_input(
-            config=(seq_lens, num_heads, head_size,
-                    block_size, output_dtype, soft_cap,
-                    num_blocks, fa_versions, q_dtype, is_sink))
+    config = (seq_lens, num_heads, head_size, block_size, output_dtype,
+              soft_cap, num_blocks, fa_versions, q_dtype, is_sink)
+    cache_key = _benchmark_cache_key(config, provider, iterations)
+    if cache_key in _BENCHMARK_RESULT_CACHE:
+        return _BENCHMARK_RESULT_CACHE[cache_key]
 
-    num_seqs = int(seq_lens.split(",")[0])
-    max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
+    def run_provider(provider_name):
+        provider_cache_key = _benchmark_cache_key(config, provider_name,
+                                                  iterations)
+        if provider_cache_key in _BENCHMARK_RESULT_CACHE:
+            return _BENCHMARK_RESULT_CACHE[provider_cache_key]
+        return benchmark_decode_with_paged_kv(
+            seq_lens=seq_lens,
+            num_heads=num_heads,
+            head_size=head_size,
+            block_size=block_size,
+            output_dtype=output_dtype,
+            soft_cap=soft_cap,
+            num_blocks=num_blocks,
+            fa_versions=fa_versions,
+            q_dtype=q_dtype,
+            is_sink=is_sink,
+            provider=provider_name,
+            iterations=iterations)
 
+    if provider == "xattention_Time_Speedup":
+        vllm_time = run_provider("vllm_xpu_kernels")
+        try:
+            xattention_time = run_provider("xattention")
+        except Exception:
+            return _cache_result(cache_key, float("nan"))
+        return _cache_result(cache_key, _safe_ratio(vllm_time,
+                                                   xattention_time))
+    if provider == "xattention_Bandwidth_Speedup":
+        vllm_bw = run_provider("vllm_xpu_kernels_memBandwidth")
+        try:
+            xattention_bw = run_provider("xattention_memBandwidth")
+        except Exception:
+            return _cache_result(cache_key, float("nan"))
+        return _cache_result(cache_key, _safe_ratio(xattention_bw, vllm_bw))
+    if provider == "xattention_MBU_Speedup":
+        vllm_mbu = run_provider("vllm_xpu_kernels_MBU")
+        try:
+            xattention_mbu = run_provider("xattention_MBU")
+        except Exception:
+            return _cache_result(cache_key, float("nan"))
+        return _cache_result(cache_key, _safe_ratio(xattention_mbu, vllm_mbu))
+
+    input_cache_key = (tuple(config), iterations)
+    if input_cache_key not in _BENCHMARK_INPUT_CACHE:
+        if _BENCHMARK_INPUT_CACHE:
+            _BENCHMARK_INPUT_CACHE.clear()
+            clear_xpu_cache()
+        maybe_quantized_query, maybe_quantized_key_cache, \
+            maybe_quantized_value_cache, max_query_len, cu_query_lens, \
+            max_kv_len, seq_k, scale, _, sink, _, \
+            _, _, _, _ = make_decode_with_paged_kv_input(config)
+
+        num_seqs = int(seq_lens.split(",")[0])
+        max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
+        queries = [
+            torch.rand_like(maybe_quantized_query) for _ in range(iterations)
+        ]
+        block_tables_list = [
+            torch.randint(0,
+                          num_blocks,
+                          (num_seqs, max_num_blocks_per_seq),
+                          dtype=torch.int32)
+            for _ in range(iterations)
+        ]
+        _BENCHMARK_INPUT_CACHE[input_cache_key] = (
+            maybe_quantized_key_cache, maybe_quantized_value_cache,
+            max_query_len, cu_query_lens, max_kv_len, seq_k, scale, sink,
+            queries, block_tables_list)
+
+    maybe_quantized_key_cache, maybe_quantized_value_cache, \
+        max_query_len, cu_query_lens, max_kv_len, seq_k, scale, sink, \
+        queries, block_tables_list = _BENCHMARK_INPUT_CACHE[input_cache_key]
+
+    provider_name = provider.replace("vllm_xpu_kernels", "vllm-xpu-kernels")
     print(f"Running config: {seq_lens, num_heads, head_size, \
                               block_size, output_dtype, soft_cap, num_blocks, \
                               fa_versions, q_dtype, \
-                              is_sink}, Provider: {provider}",
+                              is_sink}, Provider: {provider_name}",
           flush=True)
     assert iterations > 5, \
     "Number of iterations should be greater than 5 to account for warmup"
-    queries = [
-        torch.rand_like(maybe_quantized_query) for _ in range(iterations)
-    ]
 
-    if provider == "flash":
-        start_event = torch.xpu.Event(enable_timing=True)
-        end_event = torch.xpu.Event(enable_timing=True)
-        for index in range(5):
-            block_tables = torch.randint(0,
-                                         num_blocks,
-                                         (num_seqs, max_num_blocks_per_seq),
-                                         dtype=torch.int32)
-            flash_attn_varlen_func(queries[index],
-                                   maybe_quantized_key_cache,
-                                   maybe_quantized_value_cache,
-                                   max_query_len,
-                                   cu_query_lens,
-                                   max_kv_len,
-                                   seqused_k=seq_k,
-                                   softmax_scale=scale,
-                                   causal=False,
-                                   block_table=block_tables,
-                                   window_size=(-1, -1),
-                                   s_aux=sink)
-        start_event.record()
-        for index in range(5, iterations):
-            block_tables = torch.randint(0,
-                                         num_blocks,
-                                         (num_seqs, max_num_blocks_per_seq),
-                                         dtype=torch.int32)
-            flash_attn_varlen_func(queries[index],
-                                   maybe_quantized_key_cache,
-                                   maybe_quantized_value_cache,
-                                   max_query_len,
-                                   cu_query_lens,
-                                   max_kv_len,
-                                   seqused_k=seq_k,
-                                   softmax_scale=scale,
-                                   causal=False,
-                                   block_table=block_tables,
-                                   window_size=(-1, -1),
-                                   s_aux=sink)
-        end_event.record()
-        torch.xpu.synchronize()
-        ms = start_event.elapsed_time(end_event) / (iterations - 5)
-        clear_xpu_cache()
-        return 1000 * ms
-    else:
-        start_events = [
-            torch.xpu.Event(enable_timing=True)
-            for _ in range(iterations - 5)
-        ]
-        end_events = [
-            torch.xpu.Event(enable_timing=True)
-            for _ in range(iterations - 5)
-        ]
-        for index in range(iterations):
-            block_tables = torch.randint(0,
-                                         num_blocks,
-                                         (num_seqs, max_num_blocks_per_seq),
-                                         dtype=torch.int32)
-            se = start_events[index - 5] if index >= 5 else None
-            ee = end_events[index - 5] if index >= 5 else None
-            flash_attn_varlen_func_CalKernelTime(queries[index],
-                                                 maybe_quantized_key_cache,
-                                                 maybe_quantized_value_cache,
-                                                 max_query_len,
-                                                 cu_query_lens,
-                                                 max_kv_len,
-                                                 seqused_k=seq_k,
-                                                 softmax_scale=scale,
-                                                 causal=False,
-                                                 block_table=block_tables,
-                                                 window_size=(-1, -1),
-                                                 s_aux=sink,
-                                                 start_event=se,
-                                                 end_event=ee)
-        torch.xpu.synchronize()
-        total_latency = sum(
-            start_events[i].elapsed_time(end_events[i])
-            for i in range(iterations - 5)
-        )
-        ms = total_latency / (iterations - 5)
-        if provider == "flash_memBandwidth" or provider == "flash_MBU":
-            memory_load_GB = calculate_memory_usage(cu_query_lens[-1].item(),
-                                                    seq_k.sum().item(),
-                                                    num_heads, head_size,
-                                                    queries[5].dtype,
-                                                    maybe_quantized_key_cache.dtype,
-                                                    output_dtype)
-            measured_bw = memory_load_GB / (ms / 1000)
-            if provider == "flash_MBU":
-                hardware_presets = get_hardware_preset(
-                    torch.xpu.get_device_name())
-                if hardware_presets is None:
-                    clear_xpu_cache()
-                    return float("nan")
-                peak_bw = hardware_presets["memory_bandwidth_GBs"]
-                clear_xpu_cache()
-                return (measured_bw / peak_bw) * 100
-            clear_xpu_cache()
-            return measured_bw
-        clear_xpu_cache()
-        return 1000 * ms
+    use_xattention = provider.startswith("xattention")
+    provider_prefix = "xattention" if use_xattention else "vllm_xpu_kernels"
+
+    flash_op = flash_attn_varlen_func_pip \
+        if use_xattention else flash_attn_varlen_func
+
+    start_event = torch.xpu.Event(enable_timing=True)
+    end_event = torch.xpu.Event(enable_timing=True)
+    for index in range(5):
+        flash_op(queries[index],
+                maybe_quantized_key_cache,
+                maybe_quantized_value_cache,
+                max_query_len,
+                cu_query_lens,
+                max_kv_len,
+                seqused_k=seq_k,
+                softmax_scale=scale,
+                causal=False,
+                block_table=block_tables_list[index],
+                window_size=(-1, -1),
+                s_aux=sink)
+    start_event.record()
+    for index in range(5, iterations):
+        flash_op(queries[index],
+                maybe_quantized_key_cache,
+                maybe_quantized_value_cache,
+                max_query_len,
+                cu_query_lens,
+                max_kv_len,
+                seqused_k=seq_k,
+                softmax_scale=scale,
+                causal=False,
+                block_table=block_tables_list[index],
+                window_size=(-1, -1),
+                s_aux=sink)
+    end_event.record()
+    torch.xpu.synchronize()
+
+    ms = start_event.elapsed_time(end_event) / (iterations - 5)
+    time_us = 1000 * ms
+    memory_load_GB = calculate_memory_usage(
+        cu_query_lens[-1].item(),
+        seq_k.sum().item(),
+        num_heads,
+        head_size,
+        queries[5].dtype,
+        maybe_quantized_key_cache.dtype,
+        output_dtype)
+    measured_bw = memory_load_GB / (ms / 1000)
+    hardware_presets = get_hardware_preset(torch.xpu.get_device_name())
+    mbu = float("nan")
+    if hardware_presets is not None:
+        peak_bw = hardware_presets["memory_bandwidth_GBs"]
+        mbu = (measured_bw / peak_bw) * 100
+
+    _cache_result(_benchmark_cache_key(config, provider_prefix, iterations),
+                 time_us)
+    _cache_result(_benchmark_cache_key(
+        config, f"{provider_prefix}_memBandwidth", iterations), measured_bw)
+    _cache_result(_benchmark_cache_key(config, f"{provider_prefix}_MBU",
+                                      iterations), mbu)
+    clear_xpu_cache()
+    return _BENCHMARK_RESULT_CACHE[cache_key]
 
 
-def get_benchmark_decode_with_paged_kv(iterations=20):
+def get_benchmark_decode_with_paged_kv(iterations=50):
 
     @triton.testing.perf_report(
         triton.testing.Benchmark(
@@ -294,14 +416,22 @@ def get_benchmark_decode_with_paged_kv(iterations=20):
             ],
             x_vals=[tuple(c) for c in configs],
             line_arg="provider",
-            line_vals=["flash", "flash_kernelTime", "flash_memBandwidth",
-                       "flash_MBU"],
+            line_vals=["vllm_xpu_kernels", "vllm_xpu_kernels_memBandwidth",
+                       "vllm_xpu_kernels_MBU", "xattention",
+                       "xattention_memBandwidth", "xattention_MBU",
+                       "xattention_Time_Speedup",
+                       "xattention_Bandwidth_Speedup",
+                       "xattention_MBU_Speedup"],
             line_names=[
-                "FlashAttention(us)", "FlashAttention_kernelTime(us)",
-                "FlashAttention_memBandwidth(GB/s)", "FlashAttention_MBU (%)"
+                "vllm-xpu-kernels(us)",
+                "vllm-xpu-kernels_memBandwidth(GB/s)",
+                "vllm-xpu-kernels_MBU (%)", "xattention(us)",
+                "xattention_memBandwidth(GB/s)", "xattention_MBU (%)",
+                "Time Speedup", "bandwidth Speedup", "MBU Speedup"
             ],
-            styles=[("blue", "-"), ("green", "-"), ("purple", "-"),
-                    ("red", "-")],
+            styles=[("blue", "-"), ("purple", "-"), ("red", "-"),
+                    ("cyan", "-"), ("orange", "-"), ("brown", "-"),
+                    ("black", "--"), ("green", "--"), ("pink", "--")],
             ylabel="Latency (us)",
             plot_name="flash-attn-decode",
             args={},
@@ -309,18 +439,30 @@ def get_benchmark_decode_with_paged_kv(iterations=20):
     def benchmark(seq_lens, num_heads, head_size, block_size, output_dtype,
                   soft_cap, num_blocks, fa_versions, q_dtype, is_sink,
                   provider):
-        return benchmark_decode_with_paged_kv(seq_lens=seq_lens,
-                                              num_heads=num_heads,
-                                              head_size=head_size,
-                                              block_size=block_size,
-                                              output_dtype=output_dtype,
-                                              soft_cap=soft_cap,
-                                              num_blocks=num_blocks,
-                                              fa_versions=fa_versions,
-                                              q_dtype=q_dtype,
-                                              is_sink=is_sink,
-                                              provider=provider,
-                                              iterations=iterations)
+        try:
+            return benchmark_decode_with_paged_kv(seq_lens=seq_lens,
+                                                  num_heads=num_heads,
+                                                  head_size=head_size,
+                                                  block_size=block_size,
+                                                  output_dtype=output_dtype,
+                                                  soft_cap=soft_cap,
+                                                  num_blocks=num_blocks,
+                                                  fa_versions=fa_versions,
+                                                  q_dtype=q_dtype,
+                                                  is_sink=is_sink,
+                                                  provider=provider,
+                                                  iterations=iterations)
+        except Exception as e:
+            if (not provider.startswith("xattention")
+                    or provider.endswith("_Speedup")):
+                raise
+            print(f"Skipping {provider} for unsupported xattention "
+                  f"shape: {e}")
+            clear_xpu_cache()
+            config = (seq_lens, num_heads, head_size, block_size, output_dtype,
+                      soft_cap, num_blocks, fa_versions, q_dtype, is_sink)
+            cache_key = _benchmark_cache_key(config, provider, iterations)
+            return _cache_result(cache_key, float("nan"))
 
     return benchmark
 
@@ -384,7 +526,7 @@ BATCH_DECODE_CONFIGS = [
 ]
 
 
-def benchmark_batch_decode(config, iterations=200):
+def benchmark_batch_decode(config, iterations=200, use_xattention=False):
     """Benchmark a single batch decode config with GPU-event timing."""
     (seq_lens, num_heads, head_size, block_size, dtype, soft_cap,
      num_blocks, fa_versions, q_dtype, is_sink, name) = config
@@ -405,9 +547,11 @@ def benchmark_batch_decode(config, iterations=200):
                              (num_seqs, max_num_blocks_per_seq),
                              dtype=torch.int32)
                for _ in range(iterations)]
+    flash_op = flash_attn_varlen_func_pip \
+        if use_xattention else flash_attn_varlen_func
 
     def _run(i):
-        flash_attn_varlen_func(
+        flash_op(
             queries[i], maybe_quantized_key_cache,
             maybe_quantized_value_cache,
             max_query_len, cu_query_lens, max_kv_len,
@@ -446,7 +590,7 @@ if __name__ == "__main__":
     args = parse_args()
     seed = 1234
     seed_everything(seed)
-    iterations = 20
+    iterations = 100
     torch.set_default_device("xpu")
     torch.xpu.set_device("xpu:0")
 
@@ -465,6 +609,7 @@ if __name__ == "__main__":
     save_path = ensure_save_path_exists(args.save_path)
     # Run performance benchmark
     benchmark.run(print_data=True, save_path=save_path)
+    append_speedup_average_row(save_path, "flash-attn-decode")
 
     # ================================================================
     # Batch Decode Benchmark (per-seq adaptive split-K evaluation)
@@ -473,7 +618,8 @@ if __name__ == "__main__":
     print("Batch Decode Benchmark (per-seq adaptive split-K)")
     print("=" * 80)
     hdr = (f"{'config':<40} | {'batch':>5} {'kv_sum':>7} | "
-           f"{'time(us)':>9} {'BW(GB/s)':>9}")
+           f"{'vllm_us':>9} {'xattention_us':>13} {'speedup':>7} | "
+           f"{'vllm_bw':>9} {'xattention_bw':>13}")
     print(hdr)
     print("-" * 80)
 
@@ -485,11 +631,28 @@ if __name__ == "__main__":
         kv_sum = sum(kv_lens)
         try:
             avg_us, bw_gbs = benchmark_batch_decode(cfg, iterations=200)
-            print(f"{name:<40} | {num_seqs:>5} {kv_sum:>7} | "
-                  f"{avg_us:>9.1f} {bw_gbs:>9.1f}")
         except Exception as e:
             print(f"{name:<40} | {num_seqs:>5} {kv_sum:>7} | "
                   f"{'ERROR':>9} {str(e)[:20]}")
+            clear_xpu_cache()
+            continue
+
+        try:
+            xattention_avg_us, xattention_bw_gbs = benchmark_batch_decode(
+                cfg, iterations=200, use_xattention=True)
+            speedup = avg_us / xattention_avg_us
+            xattention_us_text = f"{xattention_avg_us:>13.1f}"
+            speedup_text = f"{speedup:>7.2f}"
+            xattention_bw_text = f"{xattention_bw_gbs:>13.1f}"
+        except Exception as e:
+            print(f"Skipping batch xattention for unsupported shape "
+                  f"{name}: {e}")
+            xattention_us_text = f"{float('nan'):>13.1f}"
+            speedup_text = f"{float('nan'):>7.2f}"
+            xattention_bw_text = f"{float('nan'):>13.1f}"
+        print(f"{name:<40} | {num_seqs:>5} {kv_sum:>7} | "
+              f"{avg_us:>9.1f} {xattention_us_text} {speedup_text} | "
+              f"{bw_gbs:>9.1f} {xattention_bw_text}")
         clear_xpu_cache()
 
     print("=" * 80)

@@ -14,8 +14,67 @@ decode is expressed as a varlen call by:
 """
 
 
+from importlib import metadata
+from pathlib import Path
+
 import pytest
 import torch
+
+from flash_attn.flash_attn_interface_xpu import (
+    flash_attn_with_kvcache as xattention_flash_attn_with_kvcache,
+)
+
+
+def _has_vllm_fa2_varlen_fwd() -> bool:
+    return hasattr(torch.ops._vllm_fa2_C, "varlen_fwd")
+
+
+def _find_pip_vllm_fa2_extension() -> Path | None:
+    for package_name in ("vllm-xpu-kernels", "vllm_xpu_kernels"):
+        try:
+            dist = metadata.distribution(package_name)
+        except metadata.PackageNotFoundError:
+            continue
+        for file in dist.files or ():
+            file_name = str(file)
+            if "_vllm_fa2_C" in file_name and file_name.endswith(".so"):
+                path = Path(dist.locate_file(file))
+                if path.exists():
+                    return path
+    return None
+
+
+def _load_vllm_fa2_extension() -> None:
+    """Load FA2 custom op, preferring the pip-installed extension.
+
+    Running this file directly from the repository imports Python sources from
+    the checkout, which may not include a built ``_vllm_fa2_C``. Match the MHA
+    benchmark path by loading the installed wheel's shared object first.
+    """
+    if _has_vllm_fa2_varlen_fwd():
+        return
+
+    extension_path = _find_pip_vllm_fa2_extension()
+    if extension_path is not None:
+        torch.ops.load_library(str(extension_path))
+        if _has_vllm_fa2_varlen_fwd():
+            return
+        raise RuntimeError(
+            f"loaded {extension_path}, but _vllm_fa2_C.varlen_fwd is absent")
+
+    try:
+        from vllm_xpu_kernels import _vllm_fa2_C  # noqa: F401
+    except ImportError as e:
+        raise RuntimeError(
+            "Unable to load _vllm_fa2_C from pip package or source tree") from e
+
+    if not _has_vllm_fa2_varlen_fwd():
+        raise RuntimeError(
+            "imported vllm_xpu_kernels._vllm_fa2_C, but varlen_fwd was "
+            "not registered")
+
+
+_load_vllm_fa2_extension()
 
 from vllm_xpu_kernels.flash_attn_interface import flash_attn_varlen_func
 
@@ -136,6 +195,58 @@ def _mla_decode_via_varlen(
     )
 
 
+def _mla_decode_via_xattention(
+    q_nope, q_pe, cache, block_table, cu_seqlens_q, seqused_k,
+    max_seqlen_q, max_seqlen_k, softmax_scale,
+):
+    """Pack MLA inputs for xattention dense MLA decode.
+
+    xattention uses ``flash_attn_with_kvcache`` for dense MLA decode: Q/K are
+    the RoPE slices, while QV/V are the latent slices.
+    """
+    kv_lora_rank = q_nope.shape[-1]
+    qk_rope_head_dim = q_pe.shape[-1]
+
+    if cache.dim() == 3:
+        cache = cache.unsqueeze(-2)
+    assert cache.dim() == 4 and cache.size(-2) == 1
+
+    k_cache = cache.narrow(-1, kv_lora_rank, qk_rope_head_dim)
+    v_cache = cache.narrow(-1, 0, kv_lora_rank)
+    assert k_cache.stride(-1) == 1
+    assert v_cache.stride(-1) == 1
+
+    q = torch.cat([q_nope, q_pe], dim=-1)
+    qv = q.narrow(-1, 0, kv_lora_rank)
+    q_rope = q.narrow(-1, kv_lora_rank, qk_rope_head_dim)
+
+    result = xattention_flash_attn_with_kvcache(
+        q_rope,
+        k_cache,
+        v_cache,
+        qv=qv,
+        cache_seqlens=seqused_k,
+        page_table=block_table,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        softmax_scale=softmax_scale,
+        causal=False,
+        scheduler_metadata=None,
+        return_softmax_lse=False,
+    )
+    return result[0] if isinstance(result, tuple) else result
+
+
+def _check_close(name, output, ref, config):
+    try:
+        torch.testing.assert_close(output, ref, atol=2e-2, rtol=2e-2)
+    except AssertionError as e:
+        print(f"❌ {name} differs from reference, {config} error: {e}")
+        raise
+    print(f"✅ {name} implementation matches, {config}")
+
+
 # DeepSeek-V3 shapes: kv_lora_rank=512, qk_rope_head_dim=64.
 @pytest.mark.parametrize("block_size", [64, 128])
 @pytest.mark.parametrize(
@@ -184,7 +295,16 @@ def test_mla_decode_deepseek_v3(block_size, query_lens, kv_lens, num_heads_q):
     ref = _ref_mla_decode(q_nope, q_pe, cache, bt, cu_q, sk,
                           softmax_scale, causal=False)
 
-    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+    config = (block_size, query_lens, kv_lens, num_heads_q)
+    _check_close("vllm_xpu_kernels", out, ref, config)
+
+    xattention_out = _mla_decode_via_xattention(
+        q_nope, q_pe, cache, bt, cu_q, sk,
+        max_seqlen_q=max(query_lens),
+        max_seqlen_k=max(kv_lens),
+        softmax_scale=softmax_scale,
+    )
+    _check_close("xattention", xattention_out, ref, config)
 
 
 def _call_with(num_heads_q, block_size):
@@ -207,3 +327,41 @@ def test_mla_decode_rejects_large_q_packed():
         pytest.skip("XPU not available")
     with pytest.raises(RuntimeError, match="num_heads_q"):
         _call_with(num_heads_q=16, block_size=64)
+
+
+def _run_as_script():
+    if not torch.xpu.is_available():
+        print("Skipping MLA decode comparison: XPU not available")
+        return
+
+    cases = [
+        ([1, 1, 1, 1], [37, 128, 333, 1024]),
+        ([1], [129]),
+        ([1, 1], [16, 1023]),
+    ]
+    failures = 0
+    for num_heads_q in [1, 8, 16]:
+        for query_lens, kv_lens in cases:
+            for block_size in [64, 128]:
+                try:
+                    test_mla_decode_deepseek_v3(block_size, query_lens,
+                                                kv_lens, num_heads_q)
+                except pytest.skip.Exception as e:
+                    print("Skipping MLA decode comparison, "
+                          f"{(block_size, query_lens, kv_lens, num_heads_q)}: "
+                          f"{e}")
+                except Exception:
+                    failures += 1
+
+    try:
+        test_mla_decode_rejects_large_q_packed()
+        print("✅ vllm_xpu_kernels rejects SLM-oversize MLA decode config")
+    except Exception:
+        failures += 1
+
+    if failures:
+        raise SystemExit(f"{failures} MLA decode comparison case(s) failed")
+
+
+if __name__ == "__main__":
+    _run_as_script()

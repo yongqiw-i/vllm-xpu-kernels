@@ -1,24 +1,206 @@
 # SPDX-License-Identifier: Apache-2.0
+from importlib import metadata
+from pathlib import Path
 from typing import Optional
 
 import torch
 
-#isort: off
 try:
-    from . import _vllm_fa2_C  # noqa: F401
-    FA2_UNAVAILABLE_REASON = None
-    FA2_AVAILABLE = True
+    from flash_attn.flash_attn_interface_xpu import (
+        flash_attn_varlen_func as pip_flash_attn_varlen_func,
+        flash_attn_with_kvcache as pip_flash_attn_with_kvcache,
+    )
+    PIP_FLASH_ATTN_UNAVAILABLE_REASON = None
 except ImportError as e:
-    FA2_UNAVAILABLE_REASON = str(e)
-    FA2_AVAILABLE = False
-
-#isort: on
+    pip_flash_attn_varlen_func = None
+    pip_flash_attn_with_kvcache = None
+    PIP_FLASH_ATTN_UNAVAILABLE_REASON = str(e)
 
 DEFAULT_FA_VERSION = 2
 
 
+def _has_vllm_fa2_varlen_fwd() -> bool:
+    return hasattr(torch.ops._vllm_fa2_C, "varlen_fwd")
+
+
+def _find_installed_vllm_fa2_extension() -> Optional[Path]:
+    candidates = ("vllm-xpu-kernels", "vllm_xpu_kernels")
+    for package_name in candidates:
+        try:
+            dist = metadata.distribution(package_name)
+        except metadata.PackageNotFoundError:
+            continue
+        for file in dist.files or ():
+            file_name = str(file)
+            if "_vllm_fa2_C" in file_name and file_name.endswith(".so"):
+                path = Path(dist.locate_file(file))
+                if path.exists():
+                    return path
+    return None
+
+
+def _load_vllm_fa2_extension():
+    if _has_vllm_fa2_varlen_fwd():
+        return None
+    try:
+        from vllm_xpu_kernels import _vllm_fa2_C  # noqa: F401
+    except ImportError as e:
+        import_error = e
+    else:
+        if _has_vllm_fa2_varlen_fwd():
+            return None
+        import_error = RuntimeError(
+            "imported vllm_xpu_kernels._vllm_fa2_C, but varlen_fwd was "
+            "not registered")
+
+    extension_path = _find_installed_vllm_fa2_extension()
+    if extension_path is None:
+        return str(import_error)
+    try:
+        torch.ops.load_library(str(extension_path))
+    except OSError as e:
+        return f"{import_error}; load_library({extension_path}) failed: {e}"
+    if not _has_vllm_fa2_varlen_fwd():
+        return f"loaded {extension_path}, but _vllm_fa2_C.varlen_fwd is absent"
+    return None
+
+
+FA2_UNAVAILABLE_REASON = _load_vllm_fa2_extension()
+FA2_AVAILABLE = FA2_UNAVAILABLE_REASON is None
+
+
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+
+
+def _normalize_flash_attn_result(result, return_softmax_lse: bool):
+    if isinstance(result, tuple):
+        return result[:2] if return_softmax_lse else result[0]
+    return result
+
+
+def flash_attn_varlen_func_pip(
+    q,
+    k,
+    v,
+    max_seqlen_q,
+    cu_seqlens_q,
+    max_seqlen_k,
+    cu_seqlens_k=None,
+    seqused_k=None,
+    q_v=None,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size: Optional[list[int]] = None,
+    softcap=0.0,
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+    block_table=None,
+    return_softmax_lse=False,
+    out=None,
+    scheduler_metadata=None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
+    num_splits: int = 0,
+    fa_version: int = DEFAULT_FA_VERSION,
+    s_aux: Optional[torch.Tensor] = None,
+    num_splits_kv: Optional[int] = None,
+    is_mix_batch: bool = True,
+    start_event: Optional[torch.Event] = None,
+    end_event: Optional[torch.Event] = None,
+    device: str = "xpu",
+    host_kv_lens: Optional[torch.Tensor] = None,
+):
+    """Benchmark adapter for the installed pip flash_attn XPU kernels."""
+    if pip_flash_attn_varlen_func is None or pip_flash_attn_with_kvcache is None:
+        raise RuntimeError(
+            "pip flash_attn XPU kernels are unavailable: "
+            f"{PIP_FLASH_ATTN_UNAVAILABLE_REASON}")
+    if dropout_p != 0.0:
+        raise NotImplementedError("pip flash_attn benchmark uses dropout_p=0")
+    if alibi_slopes is not None:
+        raise NotImplementedError("pip flash_attn benchmark does not use ALiBi")
+    if out is not None:
+        raise NotImplementedError("pip flash_attn benchmark does not pass out")
+    if fa_version != DEFAULT_FA_VERSION:
+        raise NotImplementedError("pip flash_attn benchmark expects FA2 shapes")
+    assert cu_seqlens_k is not None or seqused_k is not None, \
+        "cu_seqlens_k or seqused_k must be provided"
+    assert cu_seqlens_k is None or seqused_k is None, \
+        "cu_seqlens_k and seqused_k cannot be provided at the same time"
+
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1]**(-0.5)
+    if window_size is None:
+        real_window_size = (-1, -1)
+    else:
+        assert len(window_size) == 2
+        real_window_size = (window_size[0], window_size[1])
+    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+
+    if start_event is not None:
+        start_event.record()
+    if block_table is not None and max_seqlen_q == 1:
+        result = pip_flash_attn_with_kvcache(
+            q,
+            k,
+            v,
+            qv=q_v,
+            cache_seqlens=seqused_k,
+            page_table=block_table,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            softmax_scale=softmax_scale,
+            sinks=s_aux,
+            causal=causal,
+            window_size=real_window_size,
+            softcap=softcap,
+            scheduler_metadata=scheduler_metadata,
+            num_splits=num_splits_kv if num_splits_kv is not None else num_splits,
+            return_softmax_lse=return_softmax_lse,
+        )
+    else:
+        if block_table is not None:
+            if cu_seqlens_k is None:
+                assert seqused_k is not None
+                cu_seqlens_k = torch.nn.functional.pad(
+                    seqused_k.to(device=q.device, dtype=torch.int32),
+                    (1, 0)).cumsum(dim=0, dtype=torch.int32)
+            seqused_k = None
+        result = pip_flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            seqused_k=seqused_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            qv=q_v,
+            block_table=block_table,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            window_size=real_window_size,
+            softcap=softcap,
+            sinks=s_aux,
+            num_splits=num_splits,
+            deterministic=deterministic,
+            return_attn_probs=return_attn_probs,
+            return_softmax_lse=return_softmax_lse,
+        )
+    if end_event is not None:
+        end_event.record()
+    return _normalize_flash_attn_result(result, return_softmax_lse)
 
 def _as_int32_device_tensor(x, device: torch.device) -> torch.Tensor:
     if isinstance(x, torch.Tensor):
