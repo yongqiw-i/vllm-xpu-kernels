@@ -33,6 +33,132 @@ def bootstrap_benchmark_env(file_path: str):
     return repo_root, ensure_save_path_exists
 
 
+_WRAPPER_ATTN_OP_KEY_TOKENS = (
+    "_vllm_fa2_c::varlen_fwd",
+    "_vllm_fa2_c.varlen_fwd",
+    "sgl_kernel::fwd",
+    "sgl_kernel.fwd",
+    "flash_attn_with_kvcache",
+    "flash_attn_varlen_func",
+)
+
+_KERNEL_ATTN_KEY_TOKENS = (
+    "fmha::kernel",
+    "kernel::mha",
+    "xefmhafwdsplitkvkernel",
+    "reducesplitk",
+    "paged_decode",
+)
+
+_FALLBACK_ATTN_KEY_TOKENS = (
+    "flash_attn",
+    "fmha",
+    "mha",
+    "with_kvcache",
+    "varlen_fwd",
+)
+
+_NON_ATTN_KEY_TOKENS = (
+    "get_scheduler_metadata",
+    "aten::",
+    "profiler",
+    "record_function",
+    "memcpy",
+    "memset",
+    "empty",
+    "copy",
+    "contiguous",
+    "reshape",
+    "slice",
+)
+
+
+def _event_key(event: Any) -> str:
+    key = getattr(event, "key", None)
+    if key is None:
+        return ""
+    return str(key)
+
+
+def _event_self_device_time_us(event: Any) -> float:
+    for attr in ("self_device_time_total", "self_xpu_time_total"):
+        value = getattr(event, attr, None)
+        if value:
+            return float(value)
+    return 0.0
+
+
+def _event_device_time_us(event: Any) -> float:
+    for attr in ("device_time_total", "xpu_time_total"):
+        value = getattr(event, attr, None)
+        if value:
+            return float(value)
+    return _event_self_device_time_us(event)
+
+
+def extract_attention_profiled_us(
+        events: Iterable[Any],
+        iterations: int,
+        topk: int = 6) -> tuple[float, list[tuple[str, float]],
+                               list[tuple[str, float]], str]:
+    if iterations <= 0:
+        raise ValueError(f"iterations must be > 0, got {iterations}")
+
+    wrapper_matched = []
+    kernel_matched = []
+    fallback_matched = []
+    all_nonzero = []
+
+    for event in events:
+        key = _event_key(event)
+        lower_key = key.lower()
+        self_us = _event_self_device_time_us(event)
+
+        if self_us > 0:
+            all_nonzero.append((key, self_us))
+
+        # Single-layer policy (to avoid double-counting nested ops):
+        # prefer leaf kernels; fall back to wrapper ops only if leaf kernels
+        # are unavailable; then use a broad fallback as the last resort.
+        if self_us > 0 and any(token in lower_key
+                               for token in _KERNEL_ATTN_KEY_TOKENS):
+            kernel_matched.append((key, self_us))
+            continue
+
+        if self_us > 0 and any(token in lower_key
+                               for token in _WRAPPER_ATTN_OP_KEY_TOKENS):
+            wrapper_matched.append((key, self_us))
+            continue
+
+        if any(token in lower_key for token in _NON_ATTN_KEY_TOKENS):
+            continue
+
+        if self_us > 0 and any(token in lower_key
+                               for token in _FALLBACK_ATTN_KEY_TOKENS):
+            fallback_matched.append((key, self_us))
+
+    all_top = sorted(((name, us / iterations) for name, us in all_nonzero),
+                     key=lambda item: -item[1])[:topk]
+
+    if kernel_matched:
+        selected = kernel_matched
+    elif wrapper_matched:
+        selected = wrapper_matched
+    else:
+        selected = fallback_matched
+
+    if selected:
+        total_us = sum(us for _, us in selected if us > 0.0)
+        matched_top = sorted(((name, us / iterations) for name, us in selected
+                              if us > 0.0),
+                             key=lambda item: -item[1])[:topk]
+        layer = "kernel" if selected is kernel_matched else (
+            "wrapper" if selected is wrapper_matched else "fallback")
+        return total_us / iterations, matched_top, all_top, layer
+
+    return 0.0, [], all_top, "none"
+
+
 @dataclasses.dataclass
 class CudaGraphBenchParams:
     num_ops_in_cuda_graph: int
