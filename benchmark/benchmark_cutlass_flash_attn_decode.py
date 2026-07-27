@@ -6,50 +6,18 @@
 import csv
 import gc
 import math
-import os
 from pathlib import Path
-from contextlib import contextmanager
-
-
-@contextmanager
-def _suppress_fd_stderr():
-    """Temporarily redirect fd 2 (C-level stderr) to /dev/null.
-
-    The Intel ITT/USDT library prints "USDT:... ActivityProfilerController.cpp
-    profiler_start/stop" lines directly to fd 2 on every torch.profiler
-    enter/exit. Python-level sys.stderr redirects and ITT_LOG_LEVEL don't
-    catch these because they bypass the Python stdio layer.
-    """
-    save_fd = os.dup(2)
-    devnull_fd = os.open(os.devnull, os.O_WRONLY)
-    try:
-        os.dup2(devnull_fd, 2)
-        yield
-    finally:
-        os.dup2(save_fd, 2)
-        os.close(devnull_fd)
-        os.close(save_fd)
-
-# Pin this process to a single physical GPU at the Level-Zero driver level
-# (not just "current device" inside PyTorch) *before* torch/xpu is ever
-# touched. On a shared multi-GPU host, an unpinned process can have tensors
-# land on different dies across runs, or be scheduled alongside other
-# processes' work on sibling GPUs -- both indistinguishable from a real
-# kernel regression when only looking at wall-clock latency. Respect an
-# externally-exported ZE_AFFINITY_MASK (e.g. set by a CI runner) if present.
-os.environ.setdefault("ZE_AFFINITY_MASK", "0")
 
 import torch
 import triton
 
-from utils import (bootstrap_benchmark_env, ensure_save_path_exists,
-                   extract_attention_profiled_us)
+from utils import bootstrap_benchmark_env, ensure_save_path_exists
 
 bootstrap_benchmark_env(__file__)
 
 from benchmark.src.flash_attn_interface_ import (
-    build_vllm_decode_split_plan, build_xattn_decode_scheduler_metadata,
-    flash_attn_varlen_func_vllm, flash_attn_varlen_func_xattn)
+    flash_attn_varlen_func_CalKernelTime as flash_attn_varlen_func,
+    flash_attn_varlen_func_pip)
 from benchmark.src.get_model_config import (
     gen_cutlass_flash_attn_decode_correctness_configs as
     gen_correctness_config)
@@ -63,199 +31,12 @@ from benchmark.presets import get_hardware_preset
 DEVICE = "xpu"
 _BENCHMARK_RESULT_CACHE = {}
 _BENCHMARK_INPUT_CACHE = {}
-_PROFILE_LAYER_STATE = {}
-_PROFILE_LAYER_WARNED = set()
-
-# Per-seq decode split-K plan cap. 0 = auto: each provider's host heuristic
-# decides the cap (vllm: _vllm_get_num_splits, port of the kernel's
-# get_num_splits; xattn: num_splits_heuristic inside get_scheduler_metadata).
-# This matches the production default (vllm engine / xattn callers pass
-# num_splits=0/None -> kernel auto). Both providers still pre-compute the
-# host plan (split per seq / scheduler_metadata) once, outside the timed
-# loop, so the plan is delivered ready-made — apple-to-apple.
-DECODE_NUM_SPLITS_KV = 0
 
 
 def clear_xpu_cache():
     torch.xpu.empty_cache()
     torch.xpu.synchronize()
     gc.collect()
-
-
-def timed_median_us(run_fn, num_indices, warmup_frac=0.4, min_warmup=10,
-                    max_blocks=5, min_block_size=4, target_block_us=2000.0):
-    """Time ``run_fn(i % num_indices)`` and return a noise-robust
-    per-call latency in microseconds.
-
-    A single aggregate elapsed_time() over one long timed span (the
-    original approach) silently absorbs any drift/outliers within that
-    window. Splitting into several fixed-size timed blocks and taking the
-    median (an earlier iteration of this helper) helps, but on this box
-    fast (tens-of-us) decode kernels still showed large, *bimodal* noise
-    (e.g. 30us vs 130us) even across blocks. Root-caused via direct
-    experiment to two things:
-      1. Small blocks -- if a block's total wall time is only slightly
-         longer than one GPU clock ramp-up/idle-to-boost transition, the
-         *whole block's average* gets skewed by that one-time cost. Fix:
-         size blocks by a *target wall-clock duration* (calibrated from a
-         quick probe) instead of a fixed iteration count, so the steady
-         -state portion dominates the transition.
-      2. ``torch.xpu.synchronize()`` between blocks fully drains the
-         device queue, which lets the GPU drop to an idle/low-power clock
-         state; the *next* block then pays a fresh ramp-up tax. Fix:
-         queue all blocks back-to-back and synchronize only once, after
-         the last block, so the GPU never goes idle mid-measurement.
-    A residual ramp can still land in the first post-warmup block, so we
-    additionally drop it from the statistics once we have >=3 blocks.
-
-    Returns (median_us, stdev_us, per_block_us) so callers can also
-    surface the noise level alongside the point estimate.
-    """
-    warmup_n = max(min_warmup, int(num_indices * warmup_frac))
-    warmup_n = min(warmup_n, max(min_warmup, num_indices - min_block_size))
-
-    # Calibrate per-call latency on the tail of the warm-up so we can size
-    # blocks by target wall-clock duration rather than a fixed count.
-    calib_n = max(1, min(warmup_n, 5))
-    for i in range(warmup_n - calib_n):
-        run_fn(i % num_indices)
-    torch.xpu.synchronize()
-    calib_start = torch.xpu.Event(enable_timing=True)
-    calib_end = torch.xpu.Event(enable_timing=True)
-    calib_start.record()
-    for i in range(warmup_n - calib_n, warmup_n):
-        run_fn(i % num_indices)
-    calib_end.record()
-    torch.xpu.synchronize()
-    per_call_us = max(
-        0.1, calib_start.elapsed_time(calib_end) * 1000.0 / calib_n)
-
-    block_size = max(min_block_size, round(target_block_us / per_call_us))
-    n_blocks = max(1, max_blocks)
-
-    # Queue every block back-to-back with only event markers in between;
-    # a single final synchronize() avoids the idle-gap clock reset that a
-    # per-block torch.xpu.synchronize() would otherwise cause.
-    events = []
-    idx = warmup_n
-    for _ in range(n_blocks):
-        start_event = torch.xpu.Event(enable_timing=True)
-        start_event.record()
-        for i in range(idx, idx + block_size):
-            run_fn(i % num_indices)
-        end_event = torch.xpu.Event(enable_timing=True)
-        end_event.record()
-        events.append((start_event, end_event))
-        idx += block_size
-    torch.xpu.synchronize()
-    per_block_us = [start_event.elapsed_time(end_event) * 1000.0 / block_size
-                    for start_event, end_event in events]
-
-    # The first post-warmup block is the likeliest to still catch a
-    # residual clock transition; drop it once we have enough blocks left
-    # to still get a meaningful median.
-    stats_blocks = per_block_us[1:] if len(per_block_us) >= 3 else per_block_us
-
-    sorted_blocks = sorted(stats_blocks)
-    mid = len(sorted_blocks) // 2
-    if len(sorted_blocks) % 2 == 1:
-        median_us = sorted_blocks[mid]
-    else:
-        median_us = (sorted_blocks[mid - 1] + sorted_blocks[mid]) / 2.0
-    mean_us = sum(stats_blocks) / len(stats_blocks)
-    var_us = sum((x - mean_us) ** 2
-                for x in stats_blocks) / max(1, len(stats_blocks) - 1)
-    stdev_us = var_us ** 0.5
-    return median_us, stdev_us, per_block_us
-
-
-def timed_device_us(fn, num_indices, iters=200, warmup=20):
-    """Measure per-call GPU kernel self-time via torch.profiler.
-
-    This is the apple-to-apple timing layer: it sums only attention-kernel
-    device time from the profiler table and excludes non-attention GPU ops
-    launched by wrapper logic (asserts, maybe_contiguous stride checks,
-    empty_like pool allocs, metadata prep, etc.).
-
-    Ported from kernel-benchmark's ``profile_device_us`` (common.py). ``fn``
-    is invoked as ``fn(i % num_indices)``. Runs two independent profile
-    passes and returns ``(mean_of_two, half_diff, meta)`` where
-    ``meta['layer']`` is the selected profiling layer and
-    ``meta['top_ops']`` is the selected top-op list. The half-diff between
-    the two passes stands in for stdev so the caller's
-    ``stdev > 0.1 * us`` noise alarm still fires when the two passes disagree
-    by more than ~20% (profiler yields a single aggregate per pass, so a
-    real per-block stdev is unavailable).
-    """
-    from torch.profiler import ProfilerActivity, profile
-
-    activities = [ProfilerActivity.CPU]
-    if hasattr(ProfilerActivity, "XPU"):
-        activities.append(ProfilerActivity.XPU)
-
-    n = iters - warmup
-    assert n > 0, f"iters ({iters}) must exceed warmup ({warmup})"
-
-    def _one_pass():
-        for i in range(warmup):
-            fn(i % num_indices)
-        torch.xpu.synchronize()
-        with _suppress_fd_stderr(), profile(activities=activities) as prof:
-            for i in range(n):
-                fn(i % num_indices)
-            torch.xpu.synchronize()
-        return prof
-
-    us_samples = []
-    top_ops = []
-    layers = []
-    for _ in range(2):
-        evs = _one_pass().key_averages()
-        total, matched_top, all_top, layer = extract_attention_profiled_us(evs,
-                                                                           n)
-        if total <= 0:
-            attrs = [a for a in dir(evs[0]) if "time" in a.lower()] \
-                if len(evs) else []
-            print("  [warn] attention profiler time read as 0; available "
-                  f"*time* attrs: {attrs}")
-            if all_top:
-                print("  [warn] top device ops (us/iter): "
-                      + ", ".join(f"{name}={us:.1f}" for name, us in all_top))
-            return 0.0, 0.0, {"layer": "none", "top_ops": []}
-        us_samples.append(total)
-        top_ops = matched_top
-        layers.append(layer)
-
-    median_us = sum(us_samples) / len(us_samples)
-    stdev_us = abs(us_samples[0] - us_samples[1]) / 2.0
-    selected_layer = layers[0] if layers and all(
-        layer == layers[0] for layer in layers) else "mixed"
-    return median_us, stdev_us, {
-        "layer": selected_layer,
-        "top_ops": top_ops,
-    }
-
-
-def _track_profile_layer(config, provider_prefix, profile_meta):
-    if provider_prefix not in ("vllm_xpu_kernels", "xattention"):
-        return
-    if not isinstance(profile_meta, dict):
-        return
-    layer = profile_meta.get("layer")
-    if not layer:
-        return
-
-    key = tuple(config)
-    state = _PROFILE_LAYER_STATE.setdefault(key, {})
-    state[provider_prefix] = layer
-    if ("vllm_xpu_kernels" in state and "xattention" in state
-            and state["vllm_xpu_kernels"] != state["xattention"]
-            and key not in _PROFILE_LAYER_WARNED):
-        print("  [warn] profiling layer mismatch for this config: "
-              f"vllm_xpu_kernels={state['vllm_xpu_kernels']}, "
-              f"xattention={state['xattention']}",
-              flush=True)
-        _PROFILE_LAYER_WARNED.add(key)
 
 
 def calculate_memory_usage(q_len_sum, kv_len_sum, num_heads, head_size,
@@ -414,15 +195,13 @@ def calculate_diff_decode_paged_kv(config):
                   causal=False,
                   block_table=block_tables,
                   window_size=(-1, -1),
-                  s_aux=sink,
-                  host_kv_lens=seq_k,
-                  num_splits_kv=DECODE_NUM_SPLITS_KV)
+                  s_aux=sink)
 
-    output = run_op(flash_attn_varlen_func_vllm)
+    output = run_op(flash_attn_varlen_func)
     pip_output = None
     pip_error = None
     try:
-        pip_output = run_op(flash_attn_varlen_func_xattn)
+        pip_output = run_op(flash_attn_varlen_func_pip)
     except Exception as e:
         pip_error = e
 
@@ -544,13 +323,12 @@ def benchmark_decode_with_paged_kv(seq_lens, num_heads, head_size, block_size,
             for _ in range(iterations)
         ]
         _BENCHMARK_INPUT_CACHE[input_cache_key] = (
-            maybe_quantized_query, maybe_quantized_key_cache,
-            maybe_quantized_value_cache, max_query_len, cu_query_lens,
-            max_kv_len, seq_k, scale, sink, queries, block_tables_list)
+            maybe_quantized_key_cache, maybe_quantized_value_cache,
+            max_query_len, cu_query_lens, max_kv_len, seq_k, scale, sink,
+            queries, block_tables_list)
 
-    maybe_quantized_query, maybe_quantized_key_cache, \
-        maybe_quantized_value_cache, max_query_len, cu_query_lens, \
-        max_kv_len, seq_k, scale, sink, \
+    maybe_quantized_key_cache, maybe_quantized_value_cache, \
+        max_query_len, cu_query_lens, max_kv_len, seq_k, scale, sink, \
         queries, block_tables_list = _BENCHMARK_INPUT_CACHE[input_cache_key]
 
     provider_name = provider.replace("vllm_xpu_kernels", "vllm-xpu-kernels")
@@ -559,95 +337,55 @@ def benchmark_decode_with_paged_kv(seq_lens, num_heads, head_size, block_size,
                               fa_versions, q_dtype, \
                               is_sink}, Provider: {provider_name}",
           flush=True)
-    assert iterations > 10, \
-    "Number of iterations should be greater than 10 to allow warmup + " \
-    "multiple timed blocks (see timed_median_us)"
+    assert iterations > 5, \
+    "Number of iterations should be greater than 5 to account for warmup"
 
     use_xattention = provider.startswith("xattention")
     provider_prefix = "xattention" if use_xattention else "vllm_xpu_kernels"
 
-    flash_op = flash_attn_varlen_func_xattn \
-        if use_xattention else flash_attn_varlen_func_vllm
+    flash_op = flash_attn_varlen_func_pip \
+        if use_xattention else flash_attn_varlen_func
 
-    # Pre-compute the per-provider metadata once per config, outside the timed
-    # loop, so neither provider pays any metadata-prep cost inside the timed
-    # region — apple-to-apple. xattn: get_scheduler_metadata (launches a GPU
-    # kernel, must be pre-computed). vllm: build_decode_split_plan + H2D copies
-    # (pure-host + small async copies, pre-computed for parity).
-    xattn_sched = None
-    vllm_splits = None
-    vllm_work = None
-    if use_xattention:
-        xattn_sched = build_xattn_decode_scheduler_metadata(
-            maybe_quantized_query, maybe_quantized_key_cache,
-            maybe_quantized_value_cache, max_query_len, max_kv_len,
-            cu_query_lens, seq_k, num_splits_kv=DECODE_NUM_SPLITS_KV,
-            causal=False, window_size=(-1, -1))
-        if xattn_sched is None:
-            print(f"  [warn] {provider_prefix}: scheduler_metadata pre-compute "
-                  f"returned None (xattn package lacks get_scheduler_metadata "
-                  f"or num_splits_kv<=1) -> falling back to xattn kernel "
-                  f"auto-split; this config is NOT measuring the host-plan "
-                  f"path.", flush=True)
-    else:
-        vllm_splits, vllm_work, vllm_cap = build_vllm_decode_split_plan(
-            maybe_quantized_query, maybe_quantized_key_cache, seq_k,
-            num_splits_kv=DECODE_NUM_SPLITS_KV)
-        if vllm_splits is None:
-            print(f"  [warn] {provider_prefix}: split plan pre-compute "
-                  f"returned None (host_kv_lens missing, num_splits_kv<=1, "
-                  f"or empty work_list) -> falling back to vllm kernel "
-                  f"auto-split; this config is NOT measuring the host-plan "
-                  f"path.", flush=True)
+    start_event = torch.xpu.Event(enable_timing=True)
+    end_event = torch.xpu.Event(enable_timing=True)
+    for index in range(5):
+        flash_op(queries[index],
+                maybe_quantized_key_cache,
+                maybe_quantized_value_cache,
+                max_query_len,
+                cu_query_lens,
+                max_kv_len,
+                seqused_k=seq_k,
+                softmax_scale=scale,
+                causal=False,
+                block_table=block_tables_list[index],
+                window_size=(-1, -1),
+                s_aux=sink)
+    start_event.record()
+    for index in range(5, iterations):
+        flash_op(queries[index],
+                maybe_quantized_key_cache,
+                maybe_quantized_value_cache,
+                max_query_len,
+                cu_query_lens,
+                max_kv_len,
+                seqused_k=seq_k,
+                softmax_scale=scale,
+                causal=False,
+                block_table=block_tables_list[index],
+                window_size=(-1, -1),
+                s_aux=sink)
+    end_event.record()
+    torch.xpu.synchronize()
 
-    if use_xattention:
-        def _run(index):
-            flash_op(queries[index],
-                     maybe_quantized_key_cache,
-                     maybe_quantized_value_cache,
-                     max_query_len,
-                     cu_query_lens,
-                     max_kv_len,
-                     seqused_k=seq_k,
-                     softmax_scale=scale,
-                     causal=False,
-                     block_table=block_tables_list[index],
-                     window_size=(-1, -1),
-                     s_aux=sink,
-                     num_splits_kv=DECODE_NUM_SPLITS_KV,
-                     scheduler_metadata=xattn_sched)
-    else:
-        def _run(index):
-            flash_op(queries[index],
-                     maybe_quantized_key_cache,
-                     maybe_quantized_value_cache,
-                     max_query_len,
-                     cu_query_lens,
-                     max_kv_len,
-                     seqused_k=seq_k,
-                     softmax_scale=scale,
-                     causal=False,
-                     block_table=block_tables_list[index],
-                     window_size=(-1, -1),
-                     s_aux=sink,
-                     num_splits_kv=DECODE_NUM_SPLITS_KV,
-                     splits_per_seq_dev=vllm_splits,
-                     work_list_dev=vllm_work)
-
-    time_us, time_stdev_us, profile_meta = timed_device_us(_run, iterations)
-    _track_profile_layer(config, provider_prefix, profile_meta)
-    if time_stdev_us > 0.1 * time_us:
-        print(f"  [warn] {provider_prefix} timing noisy: "
-              f"median={time_us:.1f}us stdev={time_stdev_us:.1f}us "
-              f"({100 * time_stdev_us / time_us:.0f}% of median)",
-              flush=True)
-    ms = time_us / 1000.0
+    ms = start_event.elapsed_time(end_event) / (iterations - 5)
+    time_us = 1000 * ms
     memory_load_GB = calculate_memory_usage(
         cu_query_lens[-1].item(),
         seq_k.sum().item(),
         num_heads,
         head_size,
-        queries[0].dtype,
+        queries[5].dtype,
         maybe_quantized_key_cache.dtype,
         output_dtype)
     measured_bw = memory_load_GB / (ms / 1000)
@@ -809,72 +547,34 @@ def benchmark_batch_decode(config, iterations=200, use_xattention=False):
                              (num_seqs, max_num_blocks_per_seq),
                              dtype=torch.int32)
                for _ in range(iterations)]
-    flash_op = flash_attn_varlen_func_xattn \
-        if use_xattention else flash_attn_varlen_func_vllm
+    flash_op = flash_attn_varlen_func_pip \
+        if use_xattention else flash_attn_varlen_func
 
-    # Pre-compute per-provider metadata once per config (outside the timed
-    # loop) so neither provider pays metadata-prep cost inside timing —
-    # apple-to-apple. xattn: get_scheduler_metadata (GPU kernel). vllm:
-    # build_decode_split_plan + H2D (pure-host + small async copies).
-    xattn_sched = None
-    vllm_splits = None
-    vllm_work = None
-    if use_xattention:
-        xattn_sched = build_xattn_decode_scheduler_metadata(
-            maybe_quantized_query, maybe_quantized_key_cache,
-            maybe_quantized_value_cache, max_query_len, max_kv_len,
-            cu_query_lens, seq_k, num_splits_kv=DECODE_NUM_SPLITS_KV,
-            causal=False, window_size=(-1, -1))
-        if xattn_sched is None:
-            print("  [warn] xattention: scheduler_metadata pre-compute "
-                  "returned None (xattn package lacks get_scheduler_metadata "
-                  "or num_splits_kv<=1) -> falling back to xattn kernel "
-                  "auto-split; this config is NOT measuring the host-plan "
-                  "path.", flush=True)
-    else:
-        vllm_splits, vllm_work, vllm_cap = build_vllm_decode_split_plan(
-            maybe_quantized_query, maybe_quantized_key_cache, seq_k,
-            num_splits_kv=DECODE_NUM_SPLITS_KV)
-        if vllm_splits is None:
-            print("  [warn] vllm_xpu_kernels: split plan pre-compute "
-                  "returned None (host_kv_lens missing, num_splits_kv<=1, "
-                  "or empty work_list) -> falling back to vllm kernel "
-                  "auto-split; this config is NOT measuring the host-plan "
-                  "path.", flush=True)
+    def _run(i):
+        flash_op(
+            queries[i], maybe_quantized_key_cache,
+            maybe_quantized_value_cache,
+            max_query_len, cu_query_lens, max_kv_len,
+            seqused_k=seq_k, softmax_scale=scale,
+            causal=False, block_table=bt_list[i],
+            window_size=(-1, -1), s_aux=sink)
 
-    if use_xattention:
-        def _run(i):
-            flash_op(
-                queries[i], maybe_quantized_key_cache,
-                maybe_quantized_value_cache,
-                max_query_len, cu_query_lens, max_kv_len,
-                seqused_k=seq_k, softmax_scale=scale,
-                causal=False, block_table=bt_list[i],
-                window_size=(-1, -1), s_aux=sink,
-                num_splits_kv=DECODE_NUM_SPLITS_KV,
-                scheduler_metadata=xattn_sched)
-    else:
-        def _run(i):
-            flash_op(
-                queries[i], maybe_quantized_key_cache,
-                maybe_quantized_value_cache,
-                max_query_len, cu_query_lens, max_kv_len,
-                seqused_k=seq_k, softmax_scale=scale,
-                causal=False, block_table=bt_list[i],
-                window_size=(-1, -1), s_aux=sink,
-                num_splits_kv=DECODE_NUM_SPLITS_KV,
-                splits_per_seq_dev=vllm_splits,
-                work_list_dev=vllm_work)
+    # Warmup
+    for i in range(min(10, iterations)):
+        _run(i)
+    torch.xpu.synchronize()
 
-    # Warm-up + median-of-blocks timing (see timed_median_us docstring for
-    # why a single aggregate window is noise-prone on shared multi-GPU hosts).
-    avg_us, stdev_us, profile_meta = timed_device_us(_run, iterations)
-    _track_profile_layer(full_config, "xattention" if use_xattention else
-                         "vllm_xpu_kernels", profile_meta)
-    if stdev_us > 0.1 * avg_us:
-        print(f"  [warn] batch_decode timing noisy: median={avg_us:.1f}us "
-              f"stdev={stdev_us:.1f}us ({100 * stdev_us / avg_us:.0f}% of "
-              f"median)", flush=True)
+    # Timed
+    start_event = torch.xpu.Event(enable_timing=True)
+    end_event = torch.xpu.Event(enable_timing=True)
+    measured = iterations - 10
+    start_event.record()
+    for i in range(10, iterations):
+        _run(i)
+    end_event.record()
+    torch.xpu.synchronize()
+
+    avg_us = start_event.elapsed_time(end_event) * 1000.0 / measured
 
     # KV bandwidth (K + V, bf16 -> 2 bytes)
     kv_lens = list(map(int, seq_lens.split(",")[2].split("+")))
