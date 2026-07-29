@@ -35,11 +35,25 @@ def clear_xpu_cache():
 
 
 def calculate_flops(num_query_heads, query_lens, kv_lens, head_size,
-                    is_causal):
+                    is_causal, window_size):
     total = 0
     for sq, sk in zip(query_lens, kv_lens):
-        effective_sk = sk * 0.5 if is_causal else sk
-        total += 4 * num_query_heads * sq * effective_sk * head_size
+        is_local = window_size[0] != -1 or window_size[1] != -1
+        if not is_causal and not is_local:
+            attended_pairs = sq * sk
+        else:
+            window_left = sk if window_size[0] == -1 else window_size[0]
+            window_right = sk if window_size[1] == -1 else window_size[1]
+            if is_causal:
+                window_right = 0
+
+            attended_pairs = 0
+            for query_idx in range(sq):
+                query_position = sk - sq + query_idx
+                first_key = max(0, query_position - window_left)
+                last_key = min(sk - 1, query_position + window_right)
+                attended_pairs += max(0, last_key - first_key + 1)
+        total += 4 * num_query_heads * attended_pairs * head_size
     return total
 
 
@@ -231,12 +245,11 @@ def benchmark_varlen_with_paged_kv(num_seqs,
                 is_causal, is_paged, kv_dtype))
     num_query_heads = num_heads[0]
 
-    print(f"Running config: {num_seqs, query_lens, kv_lens, \
-                              num_heads, head_size, block_size, \
-                              window_size, output_dtype, soft_cap, num_blocks, \
-                              fa_versions, q_dtype, is_sink, is_causal, \
-                              is_paged, kv_dtype}, Provider: {provider}",
-          flush=True)
+    config_desc = (num_seqs, query_lens, kv_lens, num_heads, head_size,
+                   block_size, window_size, output_dtype, soft_cap, num_blocks,
+                   fa_versions, q_dtype, is_sink, is_causal, is_paged,
+                   kv_dtype)
+    print(f"Running config: {config_desc}, Provider: {provider}", flush=True)
     assert iterations > 5, \
     "Number of iterations should be greater than 5 to account for warmup"
 
@@ -318,7 +331,7 @@ def benchmark_varlen_with_paged_kv(num_seqs,
         ms = total_latency / (iterations - 5)
         if provider == "flash_kernel_TFLOPS" or provider == "flash_kernel_MFU":
             flops = calculate_flops(num_query_heads, query_lens, kv_lens,
-                                    head_size, is_causal)
+                                    head_size, is_causal, window_size)
             tflops = flops / (ms / 1000) / 1e12
             if provider == "flash_kernel_MFU":
                 hardware_presets = get_hardware_preset(
@@ -484,11 +497,12 @@ def get_benchmark_varlen_with_paged_kv(iterations=20):
     return benchmark
 
 
-def filter_configs(configs):
+def filter_configs(configs, allow_local=False):
     new_configs = []
     for config in configs:
+        is_local = config[6][0] != -1 or config[6][1] != -1
         if (config[5] == 128 and config[9] == 32768 and config[4] >= 192) or \
-            (config[6][0] != -1 or config[6][1] != -1):
+                (is_local and not allow_local):
             print("Skipping config due to potential OOM: ", config)
             continue
         new_configs.append(config)
@@ -515,7 +529,7 @@ if __name__ == "__main__":
         clear_xpu_cache()
 
     configs = gen_perf_configs()
-    configs = filter_configs(configs)
+    configs = filter_configs(configs, allow_local=True)
     benchmark = get_benchmark_varlen_with_paged_kv(iterations=iterations)
     save_path = ensure_save_path_exists(args.save_path)
     # Run performance benchmark

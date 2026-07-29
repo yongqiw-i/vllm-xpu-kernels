@@ -13,6 +13,35 @@ model_lists = [
     "deepseek-ai/DeepSeek-V2-Lite", "Qwen/Qwen3.5-35B-A3B", "Qwen/Qwen3-32B",
 ]
 
+attention_model_lists = [
+    *model_lists,
+    "google/gemma-4-26B-A4B-it",
+]
+
+
+def get_attention_configs(model_config):
+    """Return (query heads, KV heads, head dim, window, causal) configs."""
+    num_q_heads = model_config["num_attention_heads"]
+    num_kv_heads = model_config.get("num_global_key_value_heads")
+    head_dim = model_config.get("global_head_dim")
+    has_global_shape = num_kv_heads is not None and head_dim is not None
+    if not has_global_shape:
+        num_kv_heads = model_config["num_key_value_heads"]
+        head_dim = model_config["head_dim"]
+
+    global_causal = True if has_global_shape else None
+    configs = [
+        (num_q_heads, num_kv_heads, head_dim, (-1, -1), global_causal)
+    ]
+    sliding_window = model_config.get("sliding_window")
+    if has_global_shape and sliding_window is not None:
+        local_config = (num_q_heads, model_config["num_key_value_heads"],
+                        model_config["head_dim"], (sliding_window - 1, 0),
+                        False)
+        if local_config not in configs:
+            configs.append(local_config)
+    return configs
+
 
 def gen_cutlass_fused_moe_correctness_configs():
     mnk = [
@@ -182,18 +211,20 @@ def gen_cutlass_flash_attn_varlen_perf_configs():
 
     def get_configs_from_models():
         configs = []
-        for model in model_lists:
+        for model in attention_model_lists:
             model_config = get_model_config(model, tp_size=1)
-            head_size = [model_config["head_dim"]]
-            num_heads = [(model_config["num_attention_heads"],
-                          model_config["num_key_value_heads"])]
-
-            configs += list(
-                itertools.product(num_seqs, query_lens, kv_lens, num_heads,
-                                  head_size, block_size, window_size,
-                                  output_dtype, soft_cap, num_blocks,
-                                  fa_versions, q_dtype, is_sink, is_causal,
-                                  is_paged, kv_dtype))
+            for num_q_heads, num_kv_heads, head_dim, attn_window, \
+                    attn_causal in \
+                    get_attention_configs(model_config):
+                causal_values = (is_causal if attn_causal is None else
+                                 [attn_causal])
+                configs += list(
+                    itertools.product(
+                        num_seqs, query_lens, kv_lens,
+                        [(num_q_heads, num_kv_heads)], [head_dim], block_size,
+                        [attn_window], output_dtype, soft_cap, num_blocks,
+                        fa_versions, q_dtype, is_sink, causal_values, is_paged,
+                        kv_dtype))
 
         # Add hardcoded attention shapes (diffusion models, etc.)
         # Each entry may override query_lens / kv_lens / num_blocks to
@@ -258,11 +289,12 @@ def gen_cutlass_flash_attn_decode_correctness_configs():
     fa_versions = [2]
     q_dtype = [None]
     is_sink = [False, True]
+    window_size = [(-1, -1)]
 
     configs = list(
         itertools.product(seq_lens, num_heads, head_size, block_size,
                           output_dtype, soft_cap, num_blocks, fa_versions,
-                          q_dtype, is_sink))
+                          q_dtype, is_sink, window_size))
     return configs
 
 
@@ -271,8 +303,6 @@ def gen_cutlass_flash_attn_decode_perf_configs():
         "1,1,4096", "8,1+1+1+1+1+1+1+1,128+256+512+1024+2048+4096+8192+16384",
         "32," + "+".join(["1"] * 32) + "," + "+".join(["512"] * 32)
     ]
-    num_heads = [(4, 4), (16, 1)]
-    head_size = [64, 128, 256]
     block_size = [64, 128]
     output_dtype = [torch.float16, torch.bfloat16]
     soft_cap = [None]
@@ -282,26 +312,25 @@ def gen_cutlass_flash_attn_decode_perf_configs():
     is_sink = [False, True]
 
     configs = []
-    for model in model_lists:
+    for model in attention_model_lists:
         model_config = get_model_config(model, tp_size=1)
-        head_size = [model_config["head_dim"]]
-        num_heads = [(model_config["num_attention_heads"],
-                      model_config["num_key_value_heads"])]
-
-        configs += list(
-            itertools.product(seq_lens, num_heads, head_size, block_size,
-                              output_dtype, soft_cap, num_blocks, fa_versions,
-                              q_dtype, is_sink))
+        for num_q_heads, num_kv_heads, head_dim, attn_window, _ in \
+                get_attention_configs(model_config):
+            configs += list(
+                itertools.product(
+                    seq_lens, [(num_q_heads, num_kv_heads)], [head_dim],
+                    block_size, output_dtype, soft_cap, num_blocks, fa_versions,
+                    q_dtype, is_sink, [attn_window]))
 
     configs = set(configs)  # remove duplicates
 
     def sort_key(x):
         (seq_len, num_head, head_size, block_size, output_dtype_, soft_cap,
-         num_blocks, fa_version, q_dtype, is_sink) = x
+         num_blocks, fa_version, q_dtype, is_sink, window_size) = x
 
         return (seq_len, num_head, head_size, block_size, str(output_dtype_),
                 soft_cap if soft_cap is not None else -1, num_blocks,
-                fa_version, str(q_dtype), is_sink)
+                fa_version, str(q_dtype), is_sink, window_size)
 
     configs = sorted(configs, key=sort_key)
 

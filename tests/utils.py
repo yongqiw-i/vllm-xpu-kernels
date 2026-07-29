@@ -414,10 +414,16 @@ def get_model_config(model_name: str, tp_size: int = 1):
         "num_key_value_heads":
         getattr(config, 'num_key_value_heads',
                 getattr(config, 'num_attention_heads', 32)),
+        "num_global_key_value_heads":
+        getattr(config, 'num_global_key_value_heads', None),
         "head_dim":
         getattr(
             config, 'head_dim',
             config.hidden_size // getattr(config, 'num_attention_heads', 32)),
+        "global_head_dim":
+        getattr(config, 'global_head_dim', None),
+        "sliding_window":
+        getattr(config, 'sliding_window', None),
         "hidden_act":
         getattr(config, 'hidden_act', 'silu'),
         "max_position_embeddings":

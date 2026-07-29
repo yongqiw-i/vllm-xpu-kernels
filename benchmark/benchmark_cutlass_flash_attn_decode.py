@@ -51,7 +51,7 @@ def calculate_memory_usage(q_len_sum, kv_len_sum, num_heads, head_size,
 
 def make_decode_with_paged_kv_input(config):
     seq_lens, num_heads, head_size, block_size, \
-    output_dtype, _, num_blocks, _, q_dtype, is_sink = config
+    output_dtype, _, num_blocks, _, q_dtype, is_sink, _ = config
     # if num_heads == (16, 1) and head_size == 256:
     #     pytest.skip("skip test cases that may run out of SLM.")
     num_seqs = int(seq_lens.split(",")[0])
@@ -112,7 +112,8 @@ def make_decode_with_paged_kv_input(config):
 
 
 def calculate_diff_decode_paged_kv(config):
-    _, _, _, _, _, _, _, _, q_dtype, _ = config
+    q_dtype = config[8]
+    window_size = config[10]
     maybe_quantized_query, maybe_quantized_key_cache, \
         maybe_quantized_value_cache, max_query_len, cu_query_lens, \
         max_kv_len, seq_k, scale, block_tables, sink, query, \
@@ -129,7 +130,7 @@ def calculate_diff_decode_paged_kv(config):
                                     softmax_scale=scale,
                                     causal=False,
                                     block_table=block_tables,
-                                    window_size=(-1, -1),
+                                    window_size=window_size,
                                     s_aux=sink)
 
     ref_output = ref_paged_attn(query=query,
@@ -142,8 +143,8 @@ def calculate_diff_decode_paged_kv(config):
                                 casual=False,
                                 is_paged=True,
                                 sink=sink,
-                                window_size_left=-1,
-                                window_size_right=-1)
+                                window_size_left=window_size[0],
+                                window_size_right=window_size[1])
     atol, rtol = 1e-2, 1e-2
     if q_dtype is not None:
         atol, rtol = 1.5e-1, 1.5e-1
@@ -157,24 +158,23 @@ def calculate_diff_decode_paged_kv(config):
 
 def benchmark_decode_with_paged_kv(seq_lens, num_heads, head_size, block_size,
                                    output_dtype, soft_cap, num_blocks,
-                                   fa_versions, q_dtype, is_sink, provider,
-                                   iterations):
+                                   fa_versions, q_dtype, is_sink, window_size,
+                                   provider, iterations):
     maybe_quantized_query, maybe_quantized_key_cache, \
         maybe_quantized_value_cache, max_query_len, cu_query_lens, \
         max_kv_len, seq_k, scale, block_tables, sink, _, \
         _, _, _, _ = make_decode_with_paged_kv_input(
             config=(seq_lens, num_heads, head_size,
                     block_size, output_dtype, soft_cap,
-                    num_blocks, fa_versions, q_dtype, is_sink))
+                    num_blocks, fa_versions, q_dtype, is_sink, window_size))
 
     num_seqs = int(seq_lens.split(",")[0])
     max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
 
-    print(f"Running config: {seq_lens, num_heads, head_size, \
-                              block_size, output_dtype, soft_cap, num_blocks, \
-                              fa_versions, q_dtype, \
-                              is_sink}, Provider: {provider}",
-          flush=True)
+    config_desc = (seq_lens, num_heads, head_size, block_size, output_dtype,
+                   soft_cap, num_blocks, fa_versions, q_dtype, is_sink,
+                   window_size)
+    print(f"Running config: {config_desc}, Provider: {provider}", flush=True)
     assert iterations > 5, \
     "Number of iterations should be greater than 5 to account for warmup"
     queries = [
@@ -199,7 +199,7 @@ def benchmark_decode_with_paged_kv(seq_lens, num_heads, head_size, block_size,
                                    softmax_scale=scale,
                                    causal=False,
                                    block_table=block_tables,
-                                   window_size=(-1, -1),
+                                   window_size=window_size,
                                    s_aux=sink)
         start_event.record()
         for index in range(5, iterations):
@@ -217,7 +217,7 @@ def benchmark_decode_with_paged_kv(seq_lens, num_heads, head_size, block_size,
                                    softmax_scale=scale,
                                    causal=False,
                                    block_table=block_tables,
-                                   window_size=(-1, -1),
+                                   window_size=window_size,
                                    s_aux=sink)
         end_event.record()
         torch.xpu.synchronize()
@@ -250,7 +250,7 @@ def benchmark_decode_with_paged_kv(seq_lens, num_heads, head_size, block_size,
                                                  softmax_scale=scale,
                                                  causal=False,
                                                  block_table=block_tables,
-                                                 window_size=(-1, -1),
+                                                 window_size=window_size,
                                                  s_aux=sink,
                                                  start_event=se,
                                                  end_event=ee)
@@ -261,11 +261,15 @@ def benchmark_decode_with_paged_kv(seq_lens, num_heads, head_size, block_size,
         )
         ms = total_latency / (iterations - 5)
         if provider == "flash_memBandwidth" or provider == "flash_MBU":
+            kv_len_sum = seq_k.sum().item()
+            if window_size[0] != -1:
+                kv_len_sum = seq_k.clamp(max=window_size[0] + 1).sum().item()
+            kv_cache_dtype = maybe_quantized_key_cache.dtype
             memory_load_GB = calculate_memory_usage(cu_query_lens[-1].item(),
-                                                    seq_k.sum().item(),
+                                                    kv_len_sum,
                                                     num_heads, head_size,
                                                     queries[5].dtype,
-                                                    maybe_quantized_key_cache.dtype,
+                                                    kv_cache_dtype,
                                                     output_dtype)
             measured_bw = memory_load_GB / (ms / 1000)
             if provider == "flash_MBU":
@@ -290,7 +294,7 @@ def get_benchmark_decode_with_paged_kv(iterations=20):
             x_names=[
                 "seq_lens", "num_heads", "head_size", "block_size",
                 "output_dtype", "soft_cap", "num_blocks", "fa_versions",
-                "q_dtype", "is_sink"
+                "q_dtype", "is_sink", "window_size"
             ],
             x_vals=[tuple(c) for c in configs],
             line_arg="provider",
@@ -308,7 +312,7 @@ def get_benchmark_decode_with_paged_kv(iterations=20):
         ))
     def benchmark(seq_lens, num_heads, head_size, block_size, output_dtype,
                   soft_cap, num_blocks, fa_versions, q_dtype, is_sink,
-                  provider):
+                  window_size, provider):
         return benchmark_decode_with_paged_kv(seq_lens=seq_lens,
                                               num_heads=num_heads,
                                               head_size=head_size,
@@ -319,6 +323,7 @@ def get_benchmark_decode_with_paged_kv(iterations=20):
                                               fa_versions=fa_versions,
                                               q_dtype=q_dtype,
                                               is_sink=is_sink,
+                                              window_size=window_size,
                                               provider=provider,
                                               iterations=iterations)
 
@@ -337,10 +342,11 @@ def filter_configs(configs):
 
 
 def _mk_cfg(seq_lens, num_heads, block_size, name, head_size=128,
-            dtype=torch.bfloat16, num_blocks=2048):
-    # 11-tuple matching make_decode_with_paged_kv_input contract.
+            dtype=torch.bfloat16, num_blocks=2048,
+            window_size=(-1, -1)):
+    # 12-tuple: make_decode_with_paged_kv_input fields plus display name.
     return (seq_lens, num_heads, head_size, block_size, dtype, None,
-            num_blocks, 2, None, False, name)
+            num_blocks, 2, None, False, window_size, name)
 
 
 # Format: seq_lens="B,1+1+...,kv0+kv1+...", num_heads=(q, kv), block_size, name
@@ -387,10 +393,11 @@ BATCH_DECODE_CONFIGS = [
 def benchmark_batch_decode(config, iterations=200):
     """Benchmark a single batch decode config with GPU-event timing."""
     (seq_lens, num_heads, head_size, block_size, dtype, soft_cap,
-     num_blocks, fa_versions, q_dtype, is_sink, name) = config
+     num_blocks, fa_versions, q_dtype, is_sink, window_size, name) = config
 
     full_config = (seq_lens, num_heads, head_size, block_size, dtype,
-                   soft_cap, num_blocks, fa_versions, q_dtype, is_sink)
+                   soft_cap, num_blocks, fa_versions, q_dtype, is_sink,
+                   window_size)
     (maybe_quantized_query, maybe_quantized_key_cache,
      maybe_quantized_value_cache, max_query_len, cu_query_lens,
      max_kv_len, seq_k, scale, block_tables, sink, _,
@@ -413,7 +420,7 @@ def benchmark_batch_decode(config, iterations=200):
             max_query_len, cu_query_lens, max_kv_len,
             seqused_k=seq_k, softmax_scale=scale,
             causal=False, block_table=bt_list[i],
-            window_size=(-1, -1), s_aux=sink)
+            window_size=window_size, s_aux=sink)
 
     # Warmup
     for i in range(min(10, iterations)):
@@ -434,6 +441,9 @@ def benchmark_batch_decode(config, iterations=200):
 
     # KV bandwidth (K + V, bf16 -> 2 bytes)
     kv_lens = list(map(int, seq_lens.split(",")[2].split("+")))
+    if window_size[0] != -1:
+        kv_lens = [min(kv_len, window_size[0] + 1)
+                   for kv_len in kv_lens]
     kv_bytes = sum(kv_lens) * num_heads[1] * head_size * 2 * 2
     bw_gbs = (kv_bytes / 1e9) / (avg_us / 1e6)
 
